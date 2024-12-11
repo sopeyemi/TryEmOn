@@ -3,9 +3,9 @@ from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser, FormParser
 from .serializers import ImageSerializer
 from django.core.files.base import ContentFile
-
 import numpy as np
 import cv2
+from io import BytesIO
 from ultralytics import YOLO
 import os
 from cv2 import rectangle, putText, getTextSize, FONT_HERSHEY_SIMPLEX, LINE_AA, Canny
@@ -16,7 +16,7 @@ import webcolors
 import torch
 from torchvision import transforms, models
 from PIL import Image
-
+import random
 
 # Paths to AI models
 file_path = os.path.join('.', 'media', 'clothing_finder.pt')
@@ -24,32 +24,38 @@ file_path2 = os.path.join('.', 'media', 'fit_classifier128.pt')
 
 # Class names for object detection
 names = ["short-sleeve shirt", "long-sleeve shirt", "short-sleeveoutwear", "long-sleeveoutwear", "pair of shorts", "pair of pants", "skirt", "hat", "shoe"]
-model = YOLO(file_path) 
+model = YOLO(file_path)
 have_a_model = True
-BOX_COLOR = (0, 255, 0) # Green
-TEXT_COLOR = (255, 255, 255) # White
+BOX_COLOR = (0, 255, 0)  # Green
+TEXT_COLOR = (255, 255, 255)  # White
 
 class ImageUploadView(APIView):
     parser_classes = (MultiPartParser, FormParser)
 
-    def post(self, request, *args, **kwargs): 
+    def post(self, request, *args, **kwargs):
         serializer = ImageSerializer(data=request.data)
         if serializer.is_valid():
             # Read the uploaded image file
             image_file = request.FILES['image']
             image_array = np.fromstring(image_file.read(), np.uint8)
             img = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-            
+
             # Rate image
-            boxed_img, class_names, color_names, complexity, aesthetic, aesthetics, errors, rating, confidence = rate_my_fit(img)
+            boxed_img, class_names, color_names, complexity, aesthetic, aesthetics, errors, rating, confidence, overlay_img = rate_my_fit(img)
 
             # Encode and save
             success, buffer = cv2.imencode('.jpg', boxed_img)
             if not success:
                 return Response({"error": "Image processing failed"}, status=400)
             new_image_file = ContentFile(buffer.tobytes(), image_file.name)
-            
+
             serializer.save(image=new_image_file)
+
+            # Encode and save the overlayed image
+            success, overlay_buffer = cv2.imencode('.jpg', overlay_img)
+            if not success:
+                return Response({"error": "Overlay image processing failed"}, status=400)
+            overlay_image_file = ContentFile(overlay_buffer.tobytes(), "overlay.jpg")
 
             # Prepare JSON response data
             response_data = serializer.data
@@ -61,11 +67,13 @@ class ImageUploadView(APIView):
             response_data['ColorTheoryErrors'] = errors
             response_data['ai_rating'] = rating
             response_data['confidence'] = confidence
+            response_data['overlay_image_url'] = overlay_image_file.url
 
-            return Response(response_data, status=201) # Return the JSON response with a success status
-        return Response(serializer.errors, status=400) # Return validation errors
-    
+            return Response(response_data, status=201)  # Return the JSON response with a success status
+        return Response(serializer.errors, status=400)  # Return validation errors
+
 # Rates user outfit
+# --- rate_my_fit function ---
 def rate_my_fit(img):
     outfit = []
     class_names = []
@@ -92,12 +100,29 @@ def rate_my_fit(img):
         exit()
 
     color_names, complexity, aesthetic, aesthetics, errors = generateRating(img, outfit)
-    
+
+    # Apply overlays
+    overlay_img = img.copy() 
     for class_name, bbox in outfit:
-        img = visualize_bbox(img, bbox, class_name)
+        img = visualize_bbox(img, bbox, class_name)  # Image with boxes
 
-    return img, class_names, color_names, complexity, aesthetic, aesthetics, errors, rating, confidence
+    # Overlay long-sleeve shirt regardless of detected clothing
+    long_sleeve_overlay_path = find_clothing_overlay("long-sleeve_shirt", overlay_folder="overlays")
+    if long_sleeve_overlay_path:
+        # Calculate approximate top area for overlay
+        h, w, _ = img.shape
+        top_bbox = [0.5, 0.25, 1, 0.5]  # Center at middle, 25% height, full width, 50% height
+        overlay_img = overlay_clothing(overlay_img, top_bbox, long_sleeve_overlay_path)
 
+    # Overlay pants regardless of detected clothing
+    pants_overlay_path = find_clothing_overlay("pair_of_pants", overlay_folder="overlays")
+    if pants_overlay_path:
+        # Calculate approximate bottom area for overlay
+        h, w, _ = img.shape
+        bottom_bbox = [0.5, 0.75, 1, 0.5]  # Center at middle, 75% height, full width, 50% height
+        overlay_img = overlay_clothing(overlay_img, bottom_bbox, pants_overlay_path)
+
+    return img, class_names, color_names, complexity, aesthetic, aesthetics, errors, rating, confidence, overlay_img
 # Color Theory analysis
 def generateRating(img, outfit):
     main_colors = []
@@ -344,6 +369,77 @@ def visualize_bbox(img, bbox, class_name, color=BOX_COLOR, thickness=2):
         color=TEXT_COLOR, 
         lineType=LINE_AA,
     )
+    return img
+
+# --- find_clothing_overlay function ---
+def find_clothing_overlay(class_name, overlay_folder="overlays"):
+    """
+    Finds all matching clothing overlay files for a given class name and selects one randomly.
+
+    Args:
+        class_name (str): The category of the clothing (e.g., "long-sleeve shirt").
+        overlay_folder (str): Path to the folder containing overlay images.
+
+    Returns:
+        str: Path to the selected overlay image, or None if no matches are found.
+    """
+    pattern = class_name.replace(" ", "_")  # Replace spaces with underscores
+    matching_files = [
+        os.path.join(overlay_folder, f) for f in os.listdir(overlay_folder) 
+        if f.startswith(pattern) and (f.endswith(".png") or f.endswith(".jpg"))
+    ]
+    if not matching_files:
+        print(f"No overlay images found for class '{class_name}' in {overlay_folder}.")
+        return None
+
+    return random.choice(matching_files)
+
+# --- overlay_clothing function ---
+def overlay_clothing(img, bbox, overlay_path):
+    """
+    Overlays a clothing image onto the input image based on the bounding box.
+
+    Args:
+        img (numpy.ndarray): The base image.
+        bbox (list): Bounding box [center_x, center_y, width, height] (normalized).
+        overlay_img_path (str): Path to the clothing image.
+
+    Returns:
+        numpy.ndarray: The image with the overlay applied.
+    """
+    clothing_img = cv2.imread(overlay_path, cv2.IMREAD_UNCHANGED)
+
+    if clothing_img is None:
+        print(f"Error: Unable to load clothing image from {overlay_path}")
+        return img
+
+    h, w, _ = img.shape
+    center_x = int(bbox[0] * w)
+    center_y = int(bbox[1] * h)
+    box_width = int(bbox[2] * w)
+    box_height = int(bbox[3] * h)
+
+    top_left_x = int(center_x - box_width / 2)
+    top_left_y = int(center_y - box_height / 2)
+
+    resized_clothing = cv2.resize(clothing_img, (box_width, box_height))
+
+    if resized_clothing.shape[2] == 4:  # Check for alpha channel
+        clothing_bgr = resized_clothing[:, :, :3]
+        clothing_alpha = resized_clothing[:, :, 3] / 255.0  # Normalize alpha
+
+        roi = img[top_left_y:top_left_y + box_height, top_left_x:top_left_x + box_width]
+
+        for c in range(3):  # For each color channel
+            roi[:, :, c] = (
+                clothing_bgr[:, :, c] * clothing_alpha
+                + roi[:, :, c] * (1 - clothing_alpha)
+            )
+
+        img[top_left_y:top_left_y + box_height, top_left_x:top_left_x + box_width] = roi
+    else:
+        img[top_left_y:top_left_y + box_height, top_left_x:top_left_x + box_width] = resized_clothing
+
     return img
 
 def cropToBbox(img, bbox):
